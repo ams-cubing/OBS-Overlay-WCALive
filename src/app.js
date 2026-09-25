@@ -1,12 +1,14 @@
 import "./styles.css";
 
 const API_URL = "https://live.worldcubeassociation.org/api";
+const WCA_URL = "https://www.worldcubeassociation.org";
 const state = {
   competition: null,
   rounds: [],
   selectedRound: null,
   roundData: null,
   settings: {
+    dataSource: "live",
     mode: "leaderboard",
     resultFlow: "top",
     position: "bottom-left",
@@ -112,6 +114,12 @@ async function loadCompetitionResults(idOrWcaId) {
   return response.json();
 }
 
+async function loadWcifCompetition(wcaId) {
+  const response = await fetch(`${WCA_URL}/api/v0/competitions/${wcaId}/wcif/public`);
+  if (!response.ok) throw new Error(`WCIF publico respondio ${response.status}`);
+  return response.json();
+}
+
 async function loadRound(roundId) {
   const data = await gql(
     `query Round($id: ID!) {
@@ -146,6 +154,10 @@ function roundLabel(item) {
   return `${item.event.name} - ${item.round.name}${item.round.active ? " (activa)" : ""}`;
 }
 
+function wcifRoundId(item) {
+  return `${item.event.id}-r${item.round.number}`;
+}
+
 function flattenRounds(competition) {
   return (competition?.competitionEvents ?? []).flatMap((event) =>
     event.rounds.map((round) => ({ event: event.event, round })),
@@ -175,6 +187,113 @@ function formatResult(value, eventId) {
   const minutes = Math.floor(total / 60);
   const seconds = String(total % 60).padStart(minutes ? 2 : 1, "0");
   return minutes ? `${minutes}:${seconds}.${centis}` : `${seconds}.${centis}`;
+}
+
+function attemptsForFormat(format) {
+  if (["a", "m", "5"].includes(format)) return 5;
+  const parsed = Number(format);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 5;
+}
+
+function wcifEventName(eventId) {
+  const names = {
+    "222": "2x2x2 Cube",
+    "333": "3x3x3 Cube",
+    "333bf": "3x3x3 Blindfolded",
+    "333fm": "3x3x3 Fewest Moves",
+    "333oh": "3x3x3 One-Handed",
+    "333mbf": "3x3x3 Multi-Blind",
+    "444": "4x4x4 Cube",
+    "444bf": "4x4x4 Blindfolded",
+    "555": "5x5x5 Cube",
+    "555bf": "5x5x5 Blindfolded",
+    "666": "6x6x6 Cube",
+    "777": "7x7x7 Cube",
+    clock: "Clock",
+    minx: "Megaminx",
+    pyram: "Pyraminx",
+    skewb: "Skewb",
+    sq1: "Square-1",
+  };
+  return names[eventId] ?? eventId;
+}
+
+function normalizeWcifRound(wcif, roundId) {
+  const persons = new Map((wcif.persons ?? []).map((person) => [person.registrantId, person]));
+  for (const event of wcif.events ?? []) {
+    const round = (event.rounds ?? []).find((candidate) => candidate.id === roundId);
+    if (!round) continue;
+    const roundNumber = Number(round.id.match(/-r(\d+)/)?.[1] ?? 1);
+    return {
+      id: round.id,
+      name: roundNumber === 1 ? "First round" : round.advancementCondition ? `Round ${roundNumber}` : "Final",
+      active: (round.results ?? []).some((result) => result.ranking === null || result.best === 0),
+      finished: (round.results ?? []).some((result) => result.ranking),
+      competitionEvent: { event: { id: event.id, name: wcifEventName(event.id) } },
+      format: { id: round.format, numberOfAttempts: attemptsForFormat(round.format), sortBy: "average" },
+      advancementCondition: round.advancementCondition,
+      results: (round.results ?? []).map((result) => {
+        const person = persons.get(result.personId);
+        return {
+          id: `${round.id}-${result.personId}`,
+          ranking: result.ranking,
+          advancing: false,
+          advancingQuestionable: false,
+          attempts: (result.attempts ?? []).map((attempt) => ({ result: attempt.result })),
+          best: result.best,
+          average: result.average,
+          singleRecordTag: "",
+          averageRecordTag: "",
+          person: {
+            id: String(result.personId),
+            name: person?.name ?? `Competidor ${result.personId}`,
+            country: { iso2: person?.countryIso2 ?? "", name: person?.countryIso2 ?? "" },
+          },
+        };
+      }),
+    };
+  }
+  throw new Error(`No encontre la ronda ${roundId} en el WCIF publico`);
+}
+
+function normalizeWcifSummary(wcif) {
+  const rounds = [];
+
+  for (const event of wcif.events ?? []) {
+    for (const round of event.rounds ?? []) {
+      const normalizedRound = normalizeWcifRound(wcif, round.id);
+      const podium = normalizedRound.results.filter((result) => result.ranking > 0 && result.ranking <= 3);
+      const hasResults = normalizedRound.results.some((result) => result.attempts.some((attempt) => attempt.result));
+      const hasOpenRows = normalizedRound.results.some((result) => result.ranking === null || result.best === 0);
+      rounds.push({
+        eventId: event.id,
+        eventName: wcifEventName(event.id),
+        roundName: normalizedRound.name,
+        status: hasOpenRows ? "active" : hasResults ? "finished" : "waiting",
+        podium,
+      });
+    }
+  }
+
+  return {
+    name: wcif.name ?? wcif.shortName ?? wcif.id,
+    activeCount: rounds.filter((round) => round.status === "active").length,
+    finishedCount: rounds.filter((round) => round.status === "finished").length,
+    totalCount: rounds.length,
+    rounds: rounds.filter((round) => round.status !== "waiting"),
+  };
+}
+
+async function loadRoundFromSource({ source, competitionId, roundId }) {
+  if (source === "wcif") {
+    const wcif = await loadWcifCompetition(competitionId);
+    return normalizeWcifRound(wcif, roundId);
+  }
+  return loadRound(roundId);
+}
+
+function sourceLabel(source) {
+  return source === "wcif" ? "WCIF publico" : "WCA Live";
 }
 
 function attemptValues(result, eventId, maxAttempts) {
@@ -210,6 +329,13 @@ function renderConfig() {
 
         <section class="panel">
           <h2>Competencia y ronda</h2>
+          <label>
+            Fuente de datos
+            <select id="dataSource">
+              <option value="live">WCA Live</option>
+              <option value="wcif">WCIF publico</option>
+            </select>
+          </label>
           <div class="field-row">
             <label>
               Buscar competencia
@@ -369,6 +495,13 @@ function bindConfig() {
         state.settings[key] = Number(el.value);
       else state.settings[key] = el.value;
       document.querySelector("#vsPanel").hidden = state.settings.mode !== "vs";
+      if (key === "dataSource" && state.selectedRound) {
+        refreshRoundForConfig().then(() => {
+          updateUrl();
+          renderPreview();
+        });
+        return;
+      }
       updateUrl();
       renderPreview();
     });
@@ -422,7 +555,11 @@ async function refreshRoundForConfig() {
   state.roundData = null;
   if (!state.selectedRound) return;
   try {
-    state.roundData = await loadRound(state.selectedRound.round.id);
+    const source = state.settings.dataSource;
+    const competitionId =
+      source === "wcif" ? (state.competition.wcaId ?? state.competition.id) : state.competition.id;
+    const roundId = source === "wcif" ? wcifRoundId(state.selectedRound) : state.selectedRound.round.id;
+    state.roundData = await loadRoundFromSource({ source, competitionId, roundId });
     fillVsOptions();
   } catch {
     fillVsOptions();
@@ -462,8 +599,17 @@ function updateUrl() {
   url.search = "";
   const query = encodeSettings(state.settings);
   query.set("view", "overlay");
-  query.set("competition", state.competition.id);
-  query.set("round", state.selectedRound.round.id);
+  query.set("source", state.settings.dataSource);
+  query.set(
+    "competition",
+    state.settings.dataSource === "wcif"
+      ? (state.competition.wcaId ?? state.competition.id)
+      : state.competition.id,
+  );
+  query.set(
+    "round",
+    state.settings.dataSource === "wcif" ? wcifRoundId(state.selectedRound) : state.selectedRound.round.id,
+  );
   url.search = query.toString();
   output.textContent = url.toString();
   link.href = url.toString();
@@ -678,7 +824,7 @@ function overlayMarkup(round, settings, preview = false, pageIndex = 0) {
       <section class="lower-third transition-${settings.transition}">
         <div class="title-line">${settings.title ? `<p>${title}</p>` : ""}</div>
         <strong>${leader ? leader.person.name : "Sin resultados"}</strong>
-        <span>${leader ? `#${leader.ranking} · Mejor ${resultValue(leader, "best", eventId)} · Prom ${resultValue(leader, "average", eventId)}` : "Esperando datos de WCA Live"}</span>
+        <span>${leader ? `#${leader.ranking} · Mejor ${resultValue(leader, "best", eventId)} · Prom ${resultValue(leader, "average", eventId)}` : "Esperando resultados"}</span>
       </section>
     </div>`;
   }
@@ -741,6 +887,7 @@ function vsSide(result, eventId) {
 async function renderOverlay() {
   const search = params();
   const settings = readOverlaySettings(search);
+  const source = search.get("source") || settings.dataSource || "live";
   const competitionId = search.get("competition");
   const roundId = search.get("round");
   let currentRound = null;
@@ -763,13 +910,18 @@ async function renderOverlay() {
 
   async function fetchAndPaintSummary() {
     try {
-      const competition = await loadCompetition(competitionId);
-      const results = await loadCompetitionResults(competition.wcaId ?? competition.id);
-      currentSummary = competitionSummary(competition, results);
+      if (source === "wcif") {
+        const wcif = await loadWcifCompetition(competitionId);
+        currentSummary = normalizeWcifSummary(wcif);
+      } else {
+        const competition = await loadCompetition(competitionId);
+        const results = await loadCompetitionResults(competition.wcaId ?? competition.id);
+        currentSummary = competitionSummary(competition, results);
+      }
       if (pageIndex >= maxSummaryPage()) pageIndex = 0;
       paintSummary();
     } catch (error) {
-      app.innerHTML = `<div class="overlay-root pos-center theme-dark"><section class="scoreboard error-board">No se pudo leer WCA Live: ${error.message}</section></div>`;
+      app.innerHTML = `<div class="overlay-root pos-center theme-dark"><section class="scoreboard error-board">No se pudo leer ${sourceLabel(source)}: ${error.message}</section></div>`;
     }
   }
 
@@ -800,11 +952,11 @@ async function renderOverlay() {
 
   async function fetchAndPaint() {
     try {
-      currentRound = await loadRound(roundId);
+      currentRound = await loadRoundFromSource({ source, competitionId, roundId });
       if (pageIndex >= maxPage()) pageIndex = 0;
       paintCurrent();
     } catch (error) {
-      app.innerHTML = `<div class="overlay-root pos-center theme-dark"><section class="scoreboard error-board">No se pudo leer WCA Live: ${error.message}</section></div>`;
+      app.innerHTML = `<div class="overlay-root pos-center theme-dark"><section class="scoreboard error-board">No se pudo leer ${sourceLabel(source)}: ${error.message}</section></div>`;
     }
   }
 
